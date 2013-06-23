@@ -1,0 +1,4 @@
+cron:
+- description: expire old peers
+  url: /_cron/expire
+  schedule: every 6 hours

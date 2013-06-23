@@ -1,0 +1,8 @@
+# Ignore the development data directory
+development-data
+
+# Ignore the credentials files
+credentials.*
+
+# Ignore the Sublime Text project and workspace files
+*.sublime-*

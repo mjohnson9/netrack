@@ -1,0 +1,15 @@
+[submodule "github.com/gorilla/mux"]
+	path = github.com/gorilla/mux
+	url = git://github.com/gorilla/mux.git
+[submodule "github.com/gorilla/context"]
+	path = github.com/gorilla/context
+	url = git://github.com/gorilla/context.git
+[submodule "github.com/mjibson/appstats"]
+	path = github.com/mjibson/appstats
+	url = git://github.com/mjibson/appstats.git
+[submodule "github.com/gaego/ds"]
+	path = github.com/gaego/ds
+	url = git://github.com/gaego/ds.git
+[submodule "github.com/zeebo/bencode"]
+	path = github.com/zeebo/bencode
+	url = git://github.com/zeebo/bencode.git
