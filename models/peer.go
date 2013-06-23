@@ -506,7 +506,7 @@ func actualGetPeers(future *getPeersFuture) {
 	var peerIDs []string
 
 	future.ctx.Debugf("[GetPeers] Querying for non-expired peers")
-	currentTime := time.Now()
+
 	var count int64 = 0
 	for iterator := peerQuery.Run(future.ctx); ; {
 		var thisPeer Peer
@@ -517,10 +517,6 @@ func actualGetPeers(future *getPeersFuture) {
 			future.ctx.Errorf("[GetPeers] Error retrieving peers from query: %s", err)
 			future.errorChannel <- err
 			return
-		}
-
-		if !thisPeer.Expires.After(currentTime) {
-			continue
 		}
 
 		thisPeer.Key = key
