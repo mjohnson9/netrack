@@ -181,32 +181,36 @@ func actualInsertPeer(future *insertPeerFuture) {
 
 	future.ctx.Debugf("[InsertPeer] Inserting peer: (hash: %s) (ID: %s) (IP: %s) (port: %d)", future.hash, future.peerID, future.ip, future.port)
 
+	changed := false
+	peer := new(Peer)
+
 	err := datastore.RunInTransaction(future.ctx, func(tc appengine.Context) error {
 		peerKey := getPeerKey(tc, future.hash, future.peerID)
 
-		var peer *Peer = new(Peer)
 		if err := ds.Get(tc, peerKey, peer); err == nil {
-			future.ctx.Debugf("[InsertPeer] Peer already exists, updating")
-
-			changed := false
+			future.ctx.Debugf("[InsertPeer] Peer already exists, updating...")
 
 			if peer.IP != future.ip {
 				peer.IP = future.ip
 				changed = true
+				future.ctx.Debugf("[InsertPeer] Peer's IP has changed")
 			}
 
 			if peer.Port != int32(future.port) {
 				peer.Port = int32(future.port)
 				changed = true
+				future.ctx.Debugf("[InsertPeer] Peer's port has changed")
 			}
 
 			currentTime := time.Now()
-			if peer.Expires.After(currentTime) || peer.Expires.Sub(currentTime) <= PeerRefreshTime {
+			if !peer.Expires.After(currentTime) || peer.Expires.Sub(currentTime) <= PeerRefreshTime {
 				peer.Expires = time.Now().Add(PeerExpireTime).Add(PeerExpireGrace)
 				changed = true
+				future.ctx.Debugf("[InsertPeer] Peer's expire time has changed")
 			}
 
 			if changed {
+				future.ctx.Debugf("[InsertPeer] Putting peer...")
 				_, err := ds.Put(tc, peerKey, peer)
 				if err != nil {
 					future.ctx.Errorf("[InsertPeer] Error when putting updated peer: %s", err)
@@ -217,6 +221,7 @@ func actualInsertPeer(future *insertPeerFuture) {
 				return nil
 			}
 		} else if err != dserrors.ErrNoSuchEntity {
+			peer = nil
 			future.ctx.Errorf("[InsertPeer] Error when retrieving peer from datastore for update: %s", err)
 			return err
 		}
@@ -238,26 +243,26 @@ func actualInsertPeer(future *insertPeerFuture) {
 		return err
 	}, nil)
 
-	if err == nil {
+	if err == nil && peer != nil {
 		memcacheKey := getHashKey(future.ctx, future.hash)
 		for updatesAttempted := 1; updatesAttempted <= 3; updatesAttempted++ {
 			future.ctx.Debugf("[InsertPeer] Attempting cache update #%d", updatesAttempted)
-			var peerList []string
-			if peers, memcacheErr := memcache.Gob.Get(future.ctx, memcacheKey, &peerList); memcacheErr == nil {
+			var peers []*Peer
+			if peersItem, memcacheErr := memcache.Gob.Get(future.ctx, memcacheKey, &peers); memcacheErr == nil {
 				exists := false
-				for _, thisPeerID := range peerList {
-					if thisPeerID == future.peerID {
+				for _, thisPeer := range peers {
+					if thisPeer.ID == future.peerID {
 						exists = true
 						break
 					}
 				}
 
 				if !exists {
-					peerList = append(peerList, future.peerID)
+					peers = append(peers, peer)
 
-					peers.Object = peerList
+					peersItem.Object = peers
 
-					memcacheErr := memcache.Gob.CompareAndSwap(future.ctx, peers)
+					memcacheErr := memcache.Gob.CompareAndSwap(future.ctx, peersItem)
 					if memcacheErr == nil {
 						future.ctx.Debugf("[InsertPeer] Added peer to cached peer list.")
 						break
@@ -282,11 +287,11 @@ func actualInsertPeer(future *insertPeerFuture) {
 			} else if memcacheErr == memcache.ErrCacheMiss {
 				future.ctx.Debugf("[InsertPeer] Peer list not cached. Creating...")
 
-				peers := &memcache.Item{
+				peersItem := &memcache.Item{
 					Key:    memcacheKey,
 					Object: []string{future.peerID},
 				}
-				if memcacheErr := memcache.Gob.CompareAndSwap(future.ctx, peers); memcacheErr == nil {
+				if memcacheErr := memcache.Gob.CompareAndSwap(future.ctx, peersItem); memcacheErr == nil {
 					future.ctx.Debugf("[InsertPeer] Peer list created")
 					break
 				} else if memcacheErr == memcache.ErrCASConflict {
@@ -314,8 +319,7 @@ func actualInsertPeer(future *insertPeerFuture) {
 		}
 
 		future.ctx.Debugf("[InsertPeer] Successfully inserted peer")
-	}
-	if err != nil {
+	} else if err != nil {
 		future.resultChannel <- err
 	}
 }
@@ -381,7 +385,7 @@ func actualGetPeers(future *getPeersFuture) {
 	defer close(future.resultChannel)
 
 	future.ctx.Debugf("[GetPeers] Getting peer list (%s)", future.hash)
-	var res []string
+	var res []*Peer
 	if _, err := memcache.Gob.Get(future.ctx, getHashKey(future.ctx, future.hash), &res); err == nil {
 		if len(res) == 0 {
 			future.ctx.Debugf("[GetPeers] Cached peer list is empty")
@@ -392,80 +396,42 @@ func actualGetPeers(future *getPeersFuture) {
 
 		future.ctx.Debugf("[GetPeers] Valid list exists in memcache")
 
-		var peerKeys []*datastore.Key
-
 		if len(future.include) > 0 {
-			peerKeys = append(peerKeys, getPeerKey(future.ctx, future.hash, future.include))
-		}
-
-		for _, peerID := range res {
-			if peerID == future.include {
-				continue
-			}
-
-			peerKeys = append(peerKeys, getPeerKey(future.ctx, future.hash, peerID))
-		}
-
-		if len(peerKeys) == 0 {
-			future.ctx.Debugf("[GetPeers] Peer keys list is empty")
-
-			future.ctx.Debugf("[GetPeers] Successfully retrieved peer list from memcache (empty)")
-			return
-		}
-
-		future.ctx.Debugf("[GetPeers] Retrieving peers from datastore")
-
-		peersUnfiltered := make([]Peer, len(peerKeys))
-		bad := make(map[int]bool)
-		if err := ds.GetMulti(future.ctx, peerKeys, peersUnfiltered); err != nil {
-			if multiError, ok := err.(appengine.MultiError); ok {
-				for i, thisError := range multiError {
-					if thisError != nil {
-						if thisError != dserrors.ErrNoSuchEntity {
-							future.ctx.Errorf("[GetPeers] Error retrieving peers from datastore: %s", thisError)
-							future.errorChannel <- thisError
-							return
-						} else {
-							bad[i] = true
-						}
-					}
-				}
+			peerToInclude := new(Peer)
+			if err := ds.Get(future.ctx, getPeerKey(future.ctx, future.hash, future.include), peerToInclude); err != nil {
+				future.ctx.Errorf("[GetPeers] Failed to include peer: %s", err)
 			} else {
-				if err == dserrors.ErrNoSuchEntity {
-					future.ctx.Debugf("[GetPeers] No peers in datastore. Returning empty.")
-
-					future.ctx.Debugf("[GetPeers] Successfully retrieved peer list from memcache (empty)")
-					return
-				} else {
-					future.ctx.Errorf("[GetPeers] Error retrieving peers from datastore: %s", err)
-					future.errorChannel <- err
-					return
-				}
+				res = append(res, peerToInclude)
 			}
 		}
 
-		future.ctx.Debugf("[GetPeers] Filtering peers from the datastore")
-		peersFiltered := make([]*Peer, 0, len(peersUnfiltered))
+		future.ctx.Debugf("[GetPeers] Filtering peers")
+		peersFiltered := make([]*Peer, 0, len(res))
 
 		currentTime := time.Now()
-		for i, peer := range peersUnfiltered {
-			if isBad, ok := bad[i]; ok && isBad {
+		foundInclude := false
+
+		for _, peer := range res {
+			if !peer.Expires.After(currentTime) {
 				continue
-			} else if !peer.Expires.After(currentTime) {
-				continue
+			} else if peer.ID == future.include {
+				if foundInclude {
+					continue
+				} else {
+					foundInclude = true
+				}
 			}
 
-			peer.Key = peerKeys[i]
+			peer.Key = getPeerKey(future.ctx, future.hash, peer.ID)
 
 			// We have to copy the peer to this because the "peer" variable from the loop will always be at the same address.
-			peerCopy := peer
-			peersFiltered = append(peersFiltered, &peerCopy)
+			peersFiltered = append(peersFiltered, peer)
 		}
 
 		// This looks so ugly. TODO: Clean this up
-		var filteredLength int64 = int64(len(peersFiltered) - 1)
-		if filteredLength+1 <= future.numberWanted {
-			future.ctx.Debugf("[GetPeers] Returning all %d filtered peers: request wants more than we have", filteredLength+1)
+		var filteredLength int64 = int64(len(peersFiltered))
+		if filteredLength <= future.numberWanted {
+			future.ctx.Debugf("[GetPeers] Returning all %d filtered peers: request wants more than we have", filteredLength)
 
 			for _, peer := range peersFiltered {
 				future.resultChannel <- peer
@@ -473,13 +439,13 @@ func actualGetPeers(future *getPeersFuture) {
 			return
 		}
 
-		giveNumber := int64(math.Min(float64(filteredLength+1), float64(future.numberWanted)))
+		giveNumber := int64(math.Min(float64(filteredLength), float64(future.numberWanted)))
 		given := make(map[int64]bool)
 		randomGen := rand.New(rand.NewSource(currentTime.UnixNano()))
-		future.ctx.Debugf("[GetPeers] Returning %d/%d random filtered peers", giveNumber, filteredLength+1)
+		future.ctx.Debugf("[GetPeers] Returning %d/%d random filtered peers", giveNumber, filteredLength)
 		var i int64
 		for i = 1; i <= giveNumber; i++ {
-			giveNumber := randomGen.Int63n(filteredLength)
+			giveNumber := randomGen.Int63n(filteredLength - 1)
 			if isGiven, ok := given[giveNumber]; !ok || !isGiven {
 				future.resultChannel <- peersFiltered[giveNumber]
 				given[giveNumber] = true
@@ -502,10 +468,15 @@ func actualGetPeers(future *getPeersFuture) {
 
 	peerQuery := datastore.NewQuery("Peer").Filter("Hash =", future.hash).Filter("Expires >", time.Now())
 
-	var peers []*Peer
-	var peerIDs []string
-
 	future.ctx.Debugf("[GetPeers] Querying for non-expired peers")
+
+	numPeers, err := peerQuery.Count(future.ctx)
+	if err != nil {
+		future.ctx.Warningf("[GetPeers] Failed to get count of peers: %s", err)
+		numPeers = 0
+	}
+
+	peers := make([]*Peer, 0, numPeers)
 
 	var count int64 = 0
 	for iterator := peerQuery.Run(future.ctx); ; {
@@ -522,7 +493,6 @@ func actualGetPeers(future *getPeersFuture) {
 		thisPeer.Key = key
 
 		peers = append(peers, &thisPeer)
-		peerIDs = append(peerIDs, thisPeer.ID)
 
 		if count < future.numberWanted {
 			future.resultChannel <- &thisPeer
@@ -534,8 +504,9 @@ func actualGetPeers(future *getPeersFuture) {
 
 	memcacheItem := &memcache.Item{
 		Key:    getHashKey(future.ctx, future.hash),
-		Object: peerIDs,
+		Object: peers,
 	}
+
 	if err := memcache.Gob.Set(future.ctx, memcacheItem); err == nil {
 		future.ctx.Debugf("[GetPeers] Stored peer list in memcache")
 	} else if appengine.IsCapabilityDisabled(err) {

@@ -210,7 +210,7 @@ func run(c appengine.Context, w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := &peerResponse{
-		MinimumInterval: 300,
+		MinimumInterval: uint64(models.PeerRefreshTime / time.Second),
 		Interval:        uint64(models.PeerExpireTime / time.Second),
 	}
 
