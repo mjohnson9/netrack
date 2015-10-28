@@ -24,6 +24,10 @@ skip_files:
 inbound_services:
 - warmup
 
+automatic_scaling:
+  max_idle_instances: 1
+  min_pending_latency: 500ms
+
 default_expiration: "364d"
 
 handlers:

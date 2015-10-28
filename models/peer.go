@@ -25,9 +25,9 @@ type Peer struct {
 
 const (
 	// How long we allow for a peer to contact the tracker again. This will be given to the client as the 'interval.'
-	PeerExpireTime time.Duration = 30 * time.Minute
+	PeerExpireTime time.Duration = 60 * time.Minute
 	// How often we update the expire time. This is to cut down on the amount of datastore writes that occur.
-	PeerRefreshTime time.Duration = 20 * time.Minute
+	PeerRefreshTime time.Duration = 50 * time.Minute
 	// The amount of time at which we refresh the peer.
 	peerRefreshTimeLeft time.Duration = PeerExpireTime - PeerRefreshTime
 	// The grace period for contacting the tracker. This will be added to the expire time to allow a small bit longer for the tracker to be contacted.
@@ -89,16 +89,16 @@ func actualRemovePeer(future *removePeerFuture) {
 		future.ctx.Debugf("[RemovePeer] Deleted peer from datastore.")
 		for removalsAttempted := 1; removalsAttempted <= 3; removalsAttempted++ {
 			future.ctx.Debugf("[RemovePeer] Attempting cache removal #%d", removalsAttempted)
-			var peerList []string
-			if peers, memcacheErr := memcache.Gob.Get(future.ctx, getHashKey(future.ctx, future.hash), &peerList); memcacheErr == nil {
-				for i, thisPeerID := range peerList {
-					if thisPeerID == future.peerID {
-						peerList = append(peerList[:i], peerList[i+1:]...)
+			var peers []*Peer
+			if peersItem, memcacheErr := memcache.Gob.Get(future.ctx, getHashKey(future.ctx, future.hash), &peers); memcacheErr == nil {
+				for i, peer := range peers {
+					if peer.ID == future.peerID {
+						peers = append(peers[:i], peers[i+1:]...)
 					}
 				}
 
-				peers.Object = peerList
-				memcacheErr := memcache.Gob.CompareAndSwap(future.ctx, peers)
+				peersItem.Object = peers
+				memcacheErr := memcache.Gob.CompareAndSwap(future.ctx, peersItem)
 				if memcacheErr == nil {
 					future.ctx.Debugf("[RemovePeer] Deleted peer from cached peer list.")
 					break
@@ -289,7 +289,7 @@ func actualInsertPeer(future *insertPeerFuture) {
 
 				peersItem := &memcache.Item{
 					Key:    memcacheKey,
-					Object: []string{future.peerID},
+					Object: []*Peer{peer},
 				}
 				if memcacheErr := memcache.Gob.CompareAndSwap(future.ctx, peersItem); memcacheErr == nil {
 					future.ctx.Debugf("[InsertPeer] Peer list created")
@@ -399,7 +399,11 @@ func actualGetPeers(future *getPeersFuture) {
 		if len(future.include) > 0 {
 			peerToInclude := new(Peer)
 			if err := ds.Get(future.ctx, getPeerKey(future.ctx, future.hash, future.include), peerToInclude); err != nil {
-				future.ctx.Errorf("[GetPeers] Failed to include peer: %s", err)
+				if err != dserrors.ErrNoSuchEntity {
+					future.ctx.Errorf("[GetPeers] Failed to include peer: %s", err)
+				} else {
+					future.ctx.Debugf("[GetPeers] Failed to include peer because peer doesn't exist")
+				}
 			} else {
 				res = append(res, peerToInclude)
 			}
